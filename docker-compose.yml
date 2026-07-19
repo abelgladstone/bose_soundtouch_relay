@@ -1,0 +1,14 @@
+# Host networking is required, not optional: the relay binds directly to the speaker's
+# real ports (8090, 8080, 8200, ...) on this host's LAN interface, and zeroconf needs real
+# multicast on that interface. Neither works behind Docker's default bridge/NAT networking.
+# This intentionally does NOT go through nginx/homelab-proxy -- see README.md.
+
+services:
+  relay:
+    build: .
+    image: bose-soundtouch-relay:latest
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      SPEAKER_HOST: "${SPEAKER_HOST:?set SPEAKER_HOST in .env — the speaker's real IP}"
+      RELAY_HOST: "${RELAY_HOST:?set RELAY_HOST in .env — this host's IP on the speaker's VLAN}"

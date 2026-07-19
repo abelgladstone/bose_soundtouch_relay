@@ -1,0 +1,33 @@
+# Bose SoundTouch 300 cross-VLAN relay configuration.
+#
+# The relay needs only ONE IP, on the same subnet/VLAN as the speaker -- see
+# relay/mdns.py for why a second interface isn't needed. For container deploys, prefer the
+# SPEAKER_HOST / RELAY_HOST env vars -- they override anything set here (see relay/config.py).
+
+[speaker]
+host = "192.0.2.20"   # the speaker's real IP on its VLAN (mDNS name "Zola" at time of writing)
+
+# mDNS service types to impersonate. Ports for these are learned from each service's own
+# announcement, so they don't need to be listed separately.
+service_types = [
+    "_soundtouch._tcp.local.",
+    "_spotify-connect._tcp.local.",
+    "_airplay._tcp.local.",
+    "_raop._tcp.local.",
+]
+
+# TCP ports to relay unconditionally, because they aren't themselves mDNS-advertised as
+# separate services (e.g. the gabbo push-notification WebSocket rides alongside the
+# SoundTouch API on 8090 but isn't announced on its own).
+extra_ports = [8080]
+
+[relay]
+# This host's own IP, on the same VLAN/subnet as the speaker. Reached from other VLANs via
+# ordinary routed unicast (which works fine for a normal host -- it's only the speaker's own
+# stack that refuses off-subnet peers) and via the network's existing mDNS reflection.
+host = "192.0.2.10"
+
+# Appended to each impersonated service's mDNS instance name, since the speaker's own
+# (unusable) announcement is still on the wire too and needs a distinct name to avoid
+# colliding with the relay's copy.
+name_suffix = " (relay)"

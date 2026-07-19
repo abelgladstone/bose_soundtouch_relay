@@ -1,0 +1,9 @@
+.git
+.venv
+__pycache__
+*.pyc
+*.egg-info
+.uv
+tests
+scratchpad
+*.md
