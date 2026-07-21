@@ -75,7 +75,17 @@ nginx wouldn't make any of them reachable.
 (8200) are all confirmed working end-to-end through the relay — mDNS impersonation and TCP
 relaying both verified correct, from real devices on another VLAN.
 
-**AirPlay: not supported, and not fixable here.** Confirmed via extensive packet capture
+**Fixed: mDNS-discovered ports were never actually relayed.** A `NameError` in the
+service-discovery callback (`_AIRPLAY_SERVICE_TYPES` was referenced but never defined in
+`relay/app.py`) killed the callback for *every* discovered service, silently — the
+impersonated mDNS records still got published, but no TCP listener was ever started for
+the advertised ports, so clients saw the relay's announcement and then got
+connection-refused. Only `extra_ports` (8080) escaped, being set up before discovery.
+The callback dispatch is fixed, and failures in it are now logged loudly instead of
+vanishing into an unawaited task. **Re-test AirPlay (and 8090/8200) against this build**
+— any through-the-relay result observed while this bug was live is unreliable.
+
+**AirPlay beyond this fix: likely still limited by the speaker itself.** Confirmed via extensive packet capture
 and direct testing with `pyatv` (see FINDINGS.md):
 1. The speaker's AirPlay 2 pairing handshake (`pair-setup`) never completes for a real iOS
    client, with or without the relay in the path — identical failure connecting directly to

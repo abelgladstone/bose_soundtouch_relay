@@ -8,7 +8,7 @@ import signal
 
 from relay.airplay import name_rewriter
 from relay.config import Config
-from relay.mdns import ImpersonationBridge
+from relay.mdns import ImpersonationBridge, OnService
 from relay.proxy import RelayManager
 
 _LOGGER = logging.getLogger(__name__)
@@ -21,6 +21,19 @@ _LOGGER = logging.getLogger(__name__)
 _AIRPLAY_INFO_SERVICE_TYPE = "_airplay._tcp.local."
 
 
+def make_on_service(manager: RelayManager) -> OnService:
+    """Build the mDNS-discovery callback: relay every discovered port, with the AirPlay
+    /info name-rewrite hook attached only for _airplay._tcp itself."""
+
+    async def on_service(type_: str, port: int, display_name: str) -> None:
+        if type_ == _AIRPLAY_INFO_SERVICE_TYPE:
+            await manager.ensure(port, on_first_server_message=name_rewriter(display_name))
+        else:
+            await manager.ensure(port)
+
+    return on_service
+
+
 async def run(config: Config) -> None:
     manager = RelayManager(config.relay_host, config.speaker_host)
 
@@ -30,17 +43,11 @@ async def run(config: Config) -> None:
 
     loop = asyncio.get_running_loop()
 
-    async def on_service(type_: str, port: int, display_name: str) -> None:
-        if type_ in _AIRPLAY_SERVICE_TYPES:
-            await manager.ensure(port, on_first_server_message=name_rewriter(display_name))
-        else:
-            await manager.ensure(port)
-
     bridge = ImpersonationBridge(
         service_types=config.service_types,
         speaker_host=config.speaker_host,
         relay_host=config.relay_host,
-        on_service=on_service,
+        on_service=make_on_service(manager),
         loop=loop,
         name_suffix=config.name_suffix,
     )

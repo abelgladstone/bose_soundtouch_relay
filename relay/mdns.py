@@ -111,9 +111,22 @@ class ImpersonationBridge(ServiceListener):
             _LOGGER.debug("unregister failed for %s (already gone?)", name, exc_info=True)
 
     def _schedule(self, type_: str, port: int, display_name: str) -> None:
-        self._loop.call_soon_threadsafe(
-            lambda: asyncio.ensure_future(self._on_service(type_, port, display_name))
-        )
+        # The callback is what actually starts the TCP relay for a discovered port; if it
+        # dies silently, the impersonated announcement points at a port nobody listens on.
+        # So surface any failure loudly instead of letting the task exception evaporate.
+        def _log_failure(task: asyncio.Task) -> None:
+            if not task.cancelled() and task.exception():
+                _LOGGER.error(
+                    "on_service failed for %s port %d -- relay for this port may be missing",
+                    type_, port, exc_info=task.exception(),
+                )
+
+        def _start() -> None:
+            asyncio.ensure_future(self._on_service(type_, port, display_name)).add_done_callback(
+                _log_failure
+            )
+
+        self._loop.call_soon_threadsafe(_start)
 
     # -- ServiceListener protocol (invoked on zeroconf's own thread) --------------------
 
