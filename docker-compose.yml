@@ -12,3 +12,10 @@ services:
     environment:
       SPEAKER_HOST: "${SPEAKER_HOST:?set SPEAKER_HOST in .env — the speaker's real IP}"
       RELAY_HOST: "${RELAY_HOST:?set RELAY_HOST in .env — this host's IP on the speaker's VLAN}"
+    # AirPlay's dynamic event-channel port (see relay/app.py) is handled by permanently
+    # listening on the whole candidate range (~33k ports) rather than guessing which one --
+    # the container's default 1024-fd limit isn't enough for that many listening sockets.
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536

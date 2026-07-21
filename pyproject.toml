@@ -1,6 +1,6 @@
 [project]
 name = "bose-soundtouch-relay"
-version = "0.1.0"
+version = "0.0.2"
 description = "Dual-homed mDNS + TCP relay so the Bose SoundTouch 300 is reachable from other VLANs"
 readme = "README.md"
 requires-python = ">=3.12"

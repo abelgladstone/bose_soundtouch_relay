@@ -62,12 +62,34 @@ cp .env.example .env   # fill in SPEAKER_HOST / RELAY_HOST
 docker compose up -d --build
 ```
 
+**Required host-side change: narrow the host's own ephemeral port range first.** The
+relay's standby AirPlay listeners (see "Status" below) permanently occupy TCP ports
+`32768-61000` on the relay host's interface. Because of `network_mode: host`, those aren't
+sandboxed to the container — with the kernel's default `net.ipv4.ip_local_port_range`
+(`32768-60999` on most Linux distros), the relay competes with the *host itself* (and every
+other container's outbound/NAT'd traffic) for source ports, and previously starved the
+whole host of the ability to make any new outbound connection at all. Before starting the
+relay, reserve a slice above `61000` for the host's own use:
+
+```bash
+echo 'net.ipv4.ip_local_port_range = 61001 65535' | sudo tee /etc/sysctl.d/99-bose-relay.conf
+sudo sysctl --system
+```
+
 **Deliberately not behind `homelab-proxy`/nginx on port 80.** That proxy does plain HTTP
 reverse-proxying by subpath (`http://host/<route>/` → `127.0.0.1:<port>`), which only works
 for apps that themselves speak HTTP and tolerate a path prefix — like `bose_st300`. AirPlay,
 Spotify Connect Zeroconf, and the SoundTouch API/gabbo feed aren't that: clients connect
 directly to whatever `IP:port` mDNS advertises, not to an HTTP path, so routing this through
 nginx wouldn't make any of them reachable.
+
+## Known issues
+
+- **AirPlay from the Spotify app does not work.** Streaming to the speaker over AirPlay
+  works from other apps, and Spotify playback works via Spotify Connect (the speaker's
+  native integration, relayed on port 8200) — but choosing the speaker as an AirPlay
+  output from inside the Spotify app fails. Not yet diagnosed; use Spotify Connect for
+  Spotify in the meantime.
 
 ## Status
 
@@ -82,21 +104,74 @@ impersonated mDNS records still got published, but no TCP listener was ever star
 the advertised ports, so clients saw the relay's announcement and then got
 connection-refused. Only `extra_ports` (8080) escaped, being set up before discovery.
 The callback dispatch is fixed, and failures in it are now logged loudly instead of
-vanishing into an unawaited task. **Re-test AirPlay (and 8090/8200) against this build**
-— any through-the-relay result observed while this bug was live is unreliable.
+vanishing into an unawaited task.
 
-**AirPlay beyond this fix: likely still limited by the speaker itself.** Confirmed via extensive packet capture
-and direct testing with `pyatv` (see FINDINGS.md):
-1. The speaker's AirPlay 2 pairing handshake (`pair-setup`) never completes for a real iOS
-   client, with or without the relay in the path — identical failure connecting directly to
-   the speaker, bypassing the relay entirely.
-2. Separately, AirPlay 2 also needs a dynamically-assigned second port (an "event channel"
-   negotiated during setup) that this relay doesn't proxy — a real, buildable gap in the
-   relay's scope.
-3. But even with *zero relay involved*, `pyatv` connecting directly to the speaker still
-   gets `ConnectionLostError` partway through real RTSP session setup — proving the failure
-   is in the speaker's own (end-of-life, unpatchable) AirPlay 2 firmware, not the relay.
+**AirPlay: fixed, via permanent standby listeners for the dynamic event-channel port.** A
+live packet capture of a real cross-VLAN pairing attempt (phone on VLAN1, relay + speaker
+on VLAN2) showed the control channel (port 7000) completing a full pair-setup/pair-verify
+exchange through the relay without issue, then the client opening a brand-new connection to
+a second, dynamically numbered port and getting an immediate `RST` — nothing was listening
+there. This overturns the earlier "speaker firmware is a dead end" conclusion in
+`FINDINGS.md`: that conclusion came from a `pyatv` test run *on the speaker's own subnet*,
+where the dynamic port is naturally reachable directly and this exact gap never gets
+exercised. The real cross-VLAN path was never actually broken by the firmware — it was
+broken by this relay not knowing about the second port.
 
-Building out the dynamic-port relaying (point 2) was deliberately not pursued, since point 3
-means it wouldn't make AirPlay actually work regardless — the speaker itself doesn't
-complete the connection even with no relay involved at all.
+The port number is embedded in the encrypted pair-verify payload, so the relay can never
+read it off the wire — and trying to *discover* it by probing the speaker in advance
+doesn't work either: measured against the real device, a full scan of the ephemeral range
+took 2.2-2.7s (with our own scanner, `nmap -sT`, and even a real root/`CAP_NET_RAW`
+`nmap -sS` SYN scan), well past the client's own ~2s patience, because the speaker itself
+drops/filters scan traffic and forces retransmit timeouts. Narrowing the range and
+threading the scan brought that down, but a live capture of a real pairing attempt then
+used a port *outside* the narrowed range, and separately showed the relay's own scan
+probing a port the client was actively trying to reach three times without ever getting a
+response — the speaker just doesn't reliably answer probes under load, independent of
+range or speed. No amount of scanning cleverness fixes an unreliable target.
+
+So the relay doesn't scan or guess at all. Since it only ever opens its own connection to
+the speaker *at the moment a real client connects* (see `relay/proxy.py::PortRelay`), it
+can simply listen on the entire candidate range (`32768-61000`, ~28k ports) permanently
+from startup (`relay/app.py::ensure_airplay_event_ports`). Whichever port the client's
+pair-verify payload actually names, a listener is already there waiting — the relay never
+sends the speaker a single probe packet, so there's no race and no extra load on an
+already fragile embedded stack. Two one-time costs: binding ~28k local sockets at startup
+(a few seconds), and a raised file-descriptor limit in `docker-compose.yml`
+(`ulimits.nofile`, since the container's default of 1024 isn't enough).
+
+**This range doubles as the host's own ephemeral port range, and that collision took the
+whole host down once already.** With `network_mode: host`, the relay's standby listeners
+aren't sandboxed to the container — they compete with the kernel's own pool of *source*
+ports for outbound connections (used by the host directly, and by every other container's
+NAT'd traffic, e.g. `bose-app`'s bridge-mode container still routes through the host's
+SNAT). The first deployment of this range bound almost all of `32768-65535`, which is also
+Linux's default `net.ipv4.ip_local_port_range` (`32768-60999`) — starving the entire host
+of outbound ports and breaking unrelated services (`bose-app`'s UI went down: some requests
+worked off already-established connections, others, needing a fresh one, failed outright).
+Fixed by narrowing both sides so they never overlap — see "Deployment" above for the
+required host-side `sysctl` change.
+
+**AirPlay buffering stall: fixed by relaying PTP clock sync over UDP 319/320.** With the fixes
+above deployed, a live capture showed the full pipeline working exactly as designed:
+control channel pairing completes, the dynamic event-channel port is reachable via a
+standby listener, and a real 5.4MB continuous audio stream flowed phone → relay → speaker,
+cleanly ACKed the entire way with zero drops. Polling the speaker's own SoundTouch API
+(`/now_playing`) live during two separate, independent connection attempts showed an
+identical, reproducible pattern both times:
+
+```
+source="INVALID_SOURCE" playStatus="INVALID_PLAY_STATUS"    (connecting)
+source="AIRPLAY"        playStatus="BUFFERING_STATE"         (~0.3s later)
+source="INVALID_SOURCE"                                      (~10s later, gives up)
+```
+
+That stall was misdiagnosed as a firmware dead end for a while; the missing piece was
+that the relay forwarded **TCP only, never UDP**. Besides the TCP event channel, the
+encrypted SETUP exchange also names dynamically-numbered **UDP** ports for
+timing/control, in the same 32768–61000 range — observed live: a real session sent
+steady UDP to two such ports on the relay, dying silently against closed ports. The fix
+(`relay/udp.py::UdpPortRelay`) extends the standby-listener approach to UDP across the
+same range, plus UDP 319/320 for senders that use classic PTP clock sync (the speaker
+advertises feature bits 40/41, buffered audio + PTP). First live test after the fix:
+`STANDBY → AIRPLAY/BUFFERING_STATE → PLAY_STATE` in ~3s, with real audio — the first
+time playback ever started. See `FINDINGS.md` for the full story.

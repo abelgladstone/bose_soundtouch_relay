@@ -12,6 +12,8 @@ import asyncio
 import logging
 from typing import Awaitable, Callable
 
+from relay.udp import UdpPortRelay
+
 _LOGGER = logging.getLogger(__name__)
 _CHUNK_SIZE = 65536
 
@@ -113,6 +115,7 @@ class RelayManager:
         self.bind_host = bind_host
         self.target_host = target_host
         self._relays: dict[int, PortRelay] = {}
+        self._udp_relays: dict[int, UdpPortRelay] = {}
         self._lock = asyncio.Lock()
 
     async def ensure(
@@ -131,6 +134,14 @@ class RelayManager:
             await relay.start()
             self._relays[port] = relay
 
+    async def ensure_udp(self, port: int) -> None:
+        async with self._lock:
+            if port in self._udp_relays:
+                return
+            relay = UdpPortRelay(self.bind_host, port, self.target_host)
+            await relay.start()
+            self._udp_relays[port] = relay
+
     async def remove(self, port: int) -> None:
         async with self._lock:
             relay = self._relays.pop(port, None)
@@ -139,7 +150,8 @@ class RelayManager:
 
     async def stop_all(self) -> None:
         async with self._lock:
-            relays = list(self._relays.values())
+            relays = [*self._relays.values(), *self._udp_relays.values()]
             self._relays.clear()
+            self._udp_relays.clear()
         for relay in relays:
             await relay.stop()
