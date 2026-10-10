@@ -290,6 +290,211 @@ keep their expected source port. The side symptom where the `bose_st300` UI "wen
 (paused → unknown) during AirPlay attempts was just the UI honestly rendering the
 `BUFFERING_STATE`/`INVALID_SOURCE` churn and needs no fix of its own.
 
+## Open (issue #2): AirPlay from the Spotify app fails — and the UDP relay path has never actually carried a packet
+
+Two facts discovered while chasing the Spotify-app bug, documented mid-investigation
+(work parked on the `spotify-airplay` branch):
+
+1. **Symptom:** choosing the speaker as an AirPlay output from inside the Spotify app
+   fails, while AirPlay from other iOS apps works and Spotify Connect (port 8200) works.
+
+2. **The relay's UDP forwarding is broken in production, silently.** Every working
+   AirPlay session so far ran over pure TCP; the client's UDP timing/control datagrams
+   (steady ~14/s to negotiated ports in 32768–61000, e.g. 50422, 56211) have never been
+   forwarded. Verified step by step on the relay host:
+   - The datagrams arrive on the wire (AF_PACKET capture inside the relay container).
+   - The relay process itself owns the bound UDP socket for the probed port
+     (`/proc/net/udp` inode matched against `/proc/1/fd`), rx queue empty, zero drops.
+   - No forwarded packet toward the speaker ever appears; no exception, warning, or
+     `error_received` in the logs; no ICMP unreachable back to the sender.
+   - **Not a firewall:** UFW on the host is `Status: inactive` (its systemd unit is
+     active, but the ruleset is disabled — allow rules added for udp 32768:61000 and
+     319:320 are currently dormant). A probe sent *from the relay host itself* to its
+     own standby UDP port is also not forwarded, ruling out inbound filtering entirely.
+   - Unit tests of the same `UdpPortRelay` code (single endpoint, loopback) forward
+     correctly both ways — so the suspicion is a scale/environment effect with ~28k
+     datagram endpoints on one event loop, not the per-socket logic.
+   - A full-scale loopback repro (28k TCP + 28k UDP endpoints, bound in ~8s) was
+     started on the dev machine but is inconclusive so far: the probe client couldn't
+     bind an ephemeral port because the dev machine's `ip_local_port_range` isn't
+     narrowed like the server's, so the relay's own listeners had swallowed the whole
+     range — fix the repro by binding the probe client to another loopback address
+     (e.g. 127.0.0.3) or an explicit port outside 32768–61000.
+
+   Working theory connecting the two: iOS AirPlay falls back gracefully when timing/
+   control UDP goes unanswered (hence Music etc. still play, buffered/receiver-clocked),
+   but the Spotify app's AirPlay session — possibly negotiating a realtime/UDP-audio
+   mode — does not, and fails outright. Unproven until the UDP path actually works and a
+   Spotify-app session is captured through it.
+
+Next steps: finish the full-scale repro to localize the UDP forwarding bug; fix it;
+then capture a Spotify-app AirPlay attempt (in-container AF_PACKET sniffer +
+`/now_playing` polling, same methodology as above) and compare against a working
+Music-app session.
+
+## Live diagnosis (2026-07-21): transport is proven clean; source-IP spoofing tried and ruled out
+
+Captured a real Spotify-app AirPlay session live (dependency-free AF_PACKET sniffer run
+via `docker exec` in the relay container, since neither `tcpdump` nor `scapy` is installed
+there — a minimal pure-stdlib capture-to-pcap script and a matching pcap summarizer were
+used instead; both are throwaway scratch tooling, not added to the repo). Compared against
+a fresh Music-app baseline capture, which showed the already-documented working pattern:
+control channel keepalives on 7000, then a dynamic TCP event/audio channel opening and
+streaming immediately, no UDP at all.
+
+The Spotify-app session looked structurally different and, this time, conclusively ruled
+out the relay as a transport-layer cause:
+
+- Two UDP flows open during a live session: a high-rate one (~125 pkt/s, real RTP audio,
+  payload type 96) and a low-rate one (~0.6 pkt/s, timing/control), both to dynamically
+  numbered ports within the standby range — not fixed PTP 319/320.
+- **The relay forwards both flows perfectly**: 1:1 packet counts, sub-millisecond
+  forwarding latency (median 0.11ms, max 0.77ms over 2506 packets), and the RTP sequence
+  numbers in the audio flow are strictly sequential with zero gaps end to end. No loss, no
+  reordering, no jitter — this rules out the earlier "~28k-socket single event loop scale
+  effect" theory as a live-production problem.
+- Yet the speaker reports `source=AIRPLAY`, `playStatus=PLAY_STATE`, and the correct
+  track/artist metadata throughout — and stays completely silent. This is a different
+  failure shape than the earlier PTP bug (which stalled in `BUFFERING_STATE` and timed out
+  after ~10s); here the session is stable and "successful" by every visible signal except
+  actual sound. (The Spotify app's lyrics stay in sync during this the whole time, but
+  that's driven by Spotify's own local playback-position tracking and isn't evidence the
+  speaker ever renders audio.)
+
+Working theory going in: since every *other* UDP flow the relay forwards is re-sourced as
+the relay's own address and works fine, maybe the speaker's realtime-audio path validates
+or derives its session against the original client's address, and the relay silently
+breaking that by re-sourcing packets as itself was the gap.
+
+**Tried: `relay/spoof.py` — spoof the client's real source IP:port when forwarding
+UDP toward the speaker**, via a raw `IPPROTO_RAW`/`IP_HDRINCL` socket (works because the
+relay and speaker share an L2 segment, no routing/ARP surprises; needs `CAP_NET_RAW`,
+already present in the container by default). Verified on the wire post-deploy: the
+speaker now receives the audio flow addressed from `198.51.100.37` (the phone) directly,
+zero relay IP visible in that flow at all, still 1:1 delivery with zero RTP sequence gaps
+(3759 packets checked).
+
+**Result: no change. Still silent.** This conclusively rules out source-IP validation as
+the cause — changing the sender identity the speaker sees had no effect on whether audio
+played. The spoofing code (`relay/spoof.py`) adds a raw-socket capability with no demonstrated
+benefit; it was briefly reverted from production, but is part of the 0.0.3 release and is
+what the relay host currently runs (it falls back to unspoofed forwarding without CAP_NET_RAW).
+
+**Where this leaves the search:** the remaining gap is inside the encrypted realtime-audio
+session itself — something a wire-level packet capture structurally cannot see, since the
+RTP payload is SRTP-encrypted. Two live candidates, not yet distinguished:
+- A codec/format the speaker's realtime-audio decode path doesn't support, distinct from
+  the buffered/AAC-style decode path that already works for every other app.
+- A decryption/session-derivation failure specific to the realtime negotiation (unrelated
+  to IP, since spoofing ruled that specific mechanism out).
+
+Next step, if resumed: decrypt-based diagnosis (e.g. `pyatv` acting as a real AirPlay
+client/MITM that can decrypt the SRTP session) rather than further wire-level captures,
+since passive capture has now been pushed as far as it can go without visibility into the
+encrypted payload.
+
+## Fixed: "Zola (relay)" vanished from the AirPlay picker on source change
+
+Reported live during this same session's testing: changing sources on the speaker made
+"Zola (relay)" disappear from the iOS AirPlay device picker, leaving only the real "Zola"
+(still unreachable cross-VLAN, same root cause as ever) as the visible option.
+
+Cause: `relay/mdns.py::ImpersonationBridge.remove_service` unconditionally unregistered —
+i.e. sent an mDNS goodbye packet for — the relay's impersonated copy the instant zeroconf
+reported the *real* speaker's own record removed. Embedded mDNS responders commonly do a
+brief remove-then-re-add cycle when a service's TXT state changes rather than a true
+in-place update (this speaker included: AirPlay/RAOP TXT records carry active/inactive-
+style flags that change on a source switch). That meant `remove_service` fired
+immediately, purging "Zola (relay)" from every client's cache network-wide via the
+goodbye packet, and only `add_service`'s subsequent re-publish (gated on a fresh
+`get_service_info(..., timeout=3000)` call) brought it back — during that window only the
+real, useless "Zola" was visible, matching the reported symptom. Diagnosed from code
+inspection (not yet re-confirmed against a fresh live capture of a source change, but the
+mechanism is unambiguous from the listener's control flow).
+
+**Fix, v1:** `remove_service` starts a debounce timer instead of unregistering
+immediately; `add_service` cancels it if the real record reappears within the grace
+period. Initially set to 2 seconds and shipped without a live retest.
+
+**Live retest showed the 2s version didn't actually fix it** ("Zola (relay)" still
+vanished, though the user reported it eventually came back "after a while"). A live
+capture of an actual source change nailed down two things:
+
+1. **The real churn window is ~11.5 seconds, not one quick blip** — the speaker's own
+   `_airplay`/`_raop` mDNS records visibly flapped (reduced-record announcements,
+   `ancount=1`) repeatedly between t=9.1s and t=20.6s before settling back to a full
+   announcement. 2 seconds of margin was nowhere near enough.
+2. **A real bug in the debounce itself**: `remove_service` created a new
+   `threading.Timer` on every call but never cancelled a previous pending one for the
+   same name. During repeated flapping, an orphaned earlier timer could still fire and
+   unregister the entry on its own original (now-stale) schedule, right out from under a
+   second, still-pending removal — silently defeating the whole debounce during exactly
+   the multi-flap scenario it needed to handle. This is why the entry still went away
+   even though *some* debounce logic was in place: only one of several overlapping
+   removal timers needed to slip through.
+
+**Fix, v2:** `remove_service` now cancels any existing pending timer for the same name
+before starting a new one (proper debounce semantics: every call resets the clock, only
+the latest one can ever fire), and the grace period is raised to 20 seconds to
+comfortably cover the ~11.5s of observed real-world churn. Regression test:
+`tests/test_mdns.py::DebouncedRemovalTest::test_repeated_removal_resets_the_debounce_clock`.
+Not yet re-verified against another live source change.
+
+## Superseded: "clear the RAOP feature bit" didn't change Spotify's behavior
+
+The transport-clean / spoofing-ruled-out diagnosis above localizes the Spotify-app silence
+to the speaker's own *realtime* audio path (SRTP-encrypted RTP over UDP, payload type 96),
+while the *buffered* AirPlay 2 path (feature bits 40/41, used by the Music app) plays fine.
+The realtime-vs-buffered stream type is chosen inside the encrypted SETUP the relay can't
+read or rewrite, and — checked live via `curl http://<relay>:7000/info` — this speaker's
+plaintext `/info` carries **no `audioFormats` array** to filter (only `audioLatencies`,
+types 100/101/102). So there is no plaintext stream-list lever.
+
+The one plaintext *capability* lever that does exist is the AirPlay feature mask, which the
+relay already intercepts on both channels it controls:
+
+- `/info` on port 7000 — `features` is a 64-bit int (`0x1C340445F8A00` on Zola). The relay
+  already rewrites this response to swap the device name.
+- mDNS TXT — `_airplay._tcp` `features` and `_raop._tcp` `ft`, both `0x445F8A00,0x1C340`
+  (two 32-bit halves, low word first). The relay already republishes these verbatim.
+
+**Fix (shipped, awaiting live verification): clear the RAOP feature bit (30) in all three,
+presenting the receiver as buffered-audio-only**, so a sender that would otherwise pick the
+realtime/RAOP path falls back to the buffered path that works. Bits 40/41 (buffered/PTP)
+stay set, so the Music-app path is unaffected. Gated behind `force_buffered_audio`
+(`relay/config.py`, default on, `FORCE_BUFFERED_AUDIO` env / `[relay]` toml override).
+Implemented as pure, unit-tested helpers: `relay/airplay.py::clear_feature_bit` /
+`rewrite_feature_mask_txt` / `rewrite_feature_properties` (applied in the existing
+`/info` rewrite and in `relay/mdns.py::impersonated_service_info`).
+
+**Live result: no change.** Deployed to the relay host (commit `ce141ac`), verified on the
+wire that the relay's `/info` and mDNS TXT (`features`/`ft`) both came up with the RAOP bit
+actually cleared (`0x445F8A00` → `0x45F8A00`, bits 40/41 still set). Music-app AirPlay to
+"Zola (relay)" still played correctly — the regression check passed, so the buffered path
+and the rest of the deploy are unaffected. But the Spotify app was still silent. This rules
+out the capability-advertisement mechanism entirely: the Spotify app's stream-type choice
+(and the speaker's silent failure once realtime is negotiated) does not depend on what the
+receiver claims to support in `/info`/TXT, at least not via the RAOP bit. `force_buffered_audio`
+is left shipped (default on) since it's a no-op for Spotify and harmless for everything else,
+but it is not a fix.
+
+**Where this leaves the search:** every plaintext lever the relay can pull (name, feature
+mask) has now been tried and ruled out, on top of the earlier transport-level checks
+(forwarding fidelity, source-IP spoofing). The remaining unknowns are all inside the
+encrypted SETUP/SRTP session itself, invisible to wire-level capture:
+
+- Whether the *speaker itself* actually chooses to negotiate realtime for Spotify (as
+  opposed to Spotify insisting on it regardless of advertised capabilities) — undetermined,
+  since the relay can't decrypt SETUP to see the negotiation.
+- A codec/format mismatch in the realtime decode path specifically.
+- A session/key-derivation failure specific to realtime (independent of IP, per the earlier
+  spoofing test).
+
+**Next step, if resumed: `pyatv`-based MITM to decrypt the SETUP/SRTP session** and observe
+the actual negotiated stream type and codec, rather than further capability-advertisement
+guesses — this needs a live iPhone + Spotify session and is a bigger undertaking (building
+a decrypting proxy) than the fixes tried so far.
+
 **What the first live test with UDP relaying actually showed (playback WORKS now — and
 refines the theory):** the speaker went `STANDBY → AIRPLAY/BUFFERING_STATE →
 AIRPLAY/PLAY_STATE` in ~3s and real audio played — the first time it ever crossed the

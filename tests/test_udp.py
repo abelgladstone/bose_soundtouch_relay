@@ -79,6 +79,61 @@ class UdpPortRelayTest(unittest.IsolatedAsyncioTestCase):
             new_client.close()
 
 
+class _RecordingSpoofSender:
+    """Stands in for SpoofedUdpSender, recording each send instead of touching a raw
+    socket (which needs CAP_NET_RAW/root, unavailable in the test environment)."""
+
+    def __init__(self):
+        self.calls = []
+
+    def send(self, src, dst, payload):
+        self.calls.append((src, dst, payload))
+
+
+class UdpPortRelaySpoofingTest(unittest.IsolatedAsyncioTestCase):
+    """Client-to-speaker forwarding goes through the spoof sender, preserving the
+    client's real address, per relay/spoof.py's rationale (issue #2)."""
+
+    async def asyncSetUp(self):
+        self.speaker = _udp_socket("127.0.0.2")
+        self.port = self.speaker.getsockname()[1]
+        self.spoof_sender = _RecordingSpoofSender()
+        self.relay = UdpPortRelay(
+            "127.0.0.1", self.port, "127.0.0.2", spoof_sender=self.spoof_sender
+        )
+        await self.relay.start()
+        self.client = _udp_socket("127.0.0.1")
+
+    async def asyncTearDown(self):
+        await self.relay.stop()
+        self.speaker.close()
+        self.client.close()
+
+    async def test_client_datagram_sent_via_spoof_sender_not_transport(self):
+        loop = asyncio.get_running_loop()
+        client_addr = self.client.getsockname()
+        await loop.sock_sendto(self.client, b"sync", ("127.0.0.1", self.port))
+        # Give the event loop a beat to deliver the datagram to the relay.
+        with self.assertRaises(asyncio.TimeoutError):
+            await asyncio.wait_for(loop.sock_recvfrom(self.speaker, 4096), timeout=0.2)
+
+        self.assertEqual(len(self.spoof_sender.calls), 1)
+        src, dst, payload = self.spoof_sender.calls[0]
+        self.assertEqual(src, client_addr)
+        self.assertEqual(dst, ("127.0.0.2", self.port))
+        self.assertEqual(payload, b"sync")
+
+    async def test_speaker_datagram_still_returned_via_transport(self):
+        loop = asyncio.get_running_loop()
+        await loop.sock_sendto(self.client, b"sync", ("127.0.0.1", self.port))
+        await asyncio.sleep(0.05)  # let client_addr get recorded
+
+        await loop.sock_sendto(self.speaker, b"delay_resp", ("127.0.0.1", self.port))
+        data, addr = await _recvfrom(self.client)
+        self.assertEqual(data, b"delay_resp")
+        self.assertEqual(addr, ("127.0.0.1", self.port))
+
+
 class RelayManagerUdpTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.manager = RelayManager("127.0.0.1", "127.0.0.2")
@@ -102,6 +157,15 @@ class RelayManagerUdpTest(unittest.IsolatedAsyncioTestCase):
         # Port is free again -- rebinding proves the socket was really closed.
         sock = _udp_socket("127.0.0.1", self.port)
         sock.close()
+
+    async def test_udp_spoof_sender_is_passed_through_to_relays(self):
+        spoof_sender = _RecordingSpoofSender()
+        manager = RelayManager("127.0.0.1", "127.0.0.2", udp_spoof_sender=spoof_sender)
+        try:
+            await manager.ensure_udp(self.port)
+            self.assertIs(manager._udp_relays[self.port].spoof_sender, spoof_sender)
+        finally:
+            await manager.stop_all()
 
 
 if __name__ == "__main__":

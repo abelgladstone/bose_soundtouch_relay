@@ -88,8 +88,28 @@ nginx wouldn't make any of them reachable.
 - **AirPlay from the Spotify app does not work.** Streaming to the speaker over AirPlay
   works from other apps, and Spotify playback works via Spotify Connect (the speaker's
   native integration, relayed on port 8200) — but choosing the speaker as an AirPlay
-  output from inside the Spotify app fails. Not yet diagnosed; use Spotify Connect for
-  Spotify in the meantime.
+  output from inside the Spotify app connects and reports `PLAY_STATE` with correct
+  track metadata, yet produces no sound. Live diagnosis (see `FINDINGS.md`) proved the
+  relay's transport is not the cause — the audio RTP stream is forwarded with 1:1
+  delivery, sub-millisecond latency, and zero sequence gaps — and two attempted fixes made
+  no difference: spoofing the client's real source IP toward the speaker, and (most
+  recently) advertising the speaker as buffered-audio-only by clearing the AirPlay RAOP
+  feature bit in `/info` and the mDNS TXT records (both reverted/left as harmless no-ops —
+  see `FINDINGS.md`). The gap is inside the encrypted realtime-audio session itself,
+  invisible to a wire-level capture; decrypting it (e.g. a `pyatv`-based MITM) is the next
+  step if this is resumed. Use Spotify Connect for Spotify in the meantime.
+
+- **Fixed: "Zola (relay)" used to disappear from the AirPlay device picker when changing
+  sources**, leaving only the real (unreachable) "Zola" visible. Cause:
+  `relay/mdns.py::ImpersonationBridge.remove_service` unregistered (sent a goodbye packet
+  for) the relay's impersonated entry the instant the *real* speaker's own mDNS record
+  disappeared — and a live capture showed that record flapping on and off for ~11.5
+  seconds during a real source switch, not one quick blip. `remove_service` now debounces
+  behind a 20-second grace period (`_REMOVAL_GRACE_PERIOD_SECONDS`) before actually
+  unregistering, resetting the clock (not stacking a second timer) on every repeated
+  flap, and `add_service` cancels the pending removal outright once the real record
+  reappears for good. See `FINDINGS.md` for the two-iteration diagnosis (the first,
+  2-second version shipped without a live retest and turned out not to be enough).
 
 ## Status
 

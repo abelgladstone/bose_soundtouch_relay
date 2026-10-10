@@ -18,14 +18,29 @@ import asyncio
 import logging
 import re
 import socket
+import threading
 from typing import Awaitable, Callable
 
 from zeroconf import ServiceBrowser, ServiceInfo, ServiceListener, Zeroconf
+
+from relay.airplay import rewrite_feature_properties
 
 _LOGGER = logging.getLogger(__name__)
 
 # (service type, port, the relay's display name for this service) -> None
 OnService = Callable[[str, int, str], Awaitable[None]]
+
+# Embedded mDNS responders (this speaker included) commonly do a remove-then-re-add of a
+# service record when its state changes -- e.g. AirPlay's active/inactive TXT flags on a
+# source switch -- rather than a true in-place update. Unregistering the relay's
+# impersonated copy the instant the real one disappears would send a goodbye packet that
+# flashes "Zola (relay)" out of every client's mDNS cache network-wide for however long
+# the re-add takes, leaving only the real (unreachable) "Zola" visible in the meantime.
+# Give the real record this long to reappear before actually tearing the impersonated
+# copy down. A live capture of an actual source change (2026-07-21) showed the real
+# record flapping on and off repeatedly for ~11.5s before settling -- not one quick
+# blip -- so this needs real margin above that, not just enough to cover a single blip.
+_REMOVAL_GRACE_PERIOD_SECONDS = 20.0
 
 
 def _slugify(text: str) -> str:
@@ -51,17 +66,29 @@ def relay_instance_name(name: str, type_: str, suffix: str) -> str:
 
 
 def impersonated_service_info(
-    type_: str, name: str, info: ServiceInfo, relay_host: str, name_suffix: str
+    type_: str,
+    name: str,
+    info: ServiceInfo,
+    relay_host: str,
+    name_suffix: str,
+    force_buffered: bool = False,
 ) -> ServiceInfo:
-    """Build a ServiceInfo for the same service, addressed at the relay instead of the speaker."""
+    """Build a ServiceInfo for the same service, addressed at the relay instead of the speaker.
+
+    When `force_buffered`, the RAOP feature bit is cleared in the impersonated copy's
+    `features`/`ft` TXT records so the advertisement matches the buffered-only /info the
+    relay serves (see relay/airplay.py; FINDINGS.md issue #2)."""
     new_name = relay_instance_name(name, type_, name_suffix)
     server = f"{_slugify(new_name)}.local."
+    properties = dict(info.properties or {})
+    if force_buffered:
+        properties = rewrite_feature_properties(properties)
     return ServiceInfo(
         type_,
         new_name,
         addresses=[socket.inet_aton(relay_host)],
         port=info.port,
-        properties=dict(info.properties or {}),
+        properties=properties,
         server=server,
     )
 
@@ -75,16 +102,19 @@ class ImpersonationBridge(ServiceListener):
         on_service: OnService,
         loop: asyncio.AbstractEventLoop,
         name_suffix: str = " (relay)",
+        force_buffered: bool = False,
     ):
         self._service_types = service_types
         self._speaker_host = speaker_host
         self._relay_host = relay_host
         self._name_suffix = name_suffix
+        self._force_buffered = force_buffered
         self._on_service = on_service
         self._loop = loop
         self._zc: Zeroconf | None = None
         self._browsers: list[ServiceBrowser] = []
         self._published: dict[str, ServiceInfo] = {}
+        self._pending_removals: dict[str, threading.Timer] = {}
 
     def start(self) -> None:
         # One Zeroconf instance on the relay's single NIC: it browses for the speaker's
@@ -98,6 +128,9 @@ class ImpersonationBridge(ServiceListener):
         _LOGGER.info("mDNS bridge: browsing/publishing %s via %s", self._service_types, self._relay_host)
 
     def stop(self) -> None:
+        for timer in self._pending_removals.values():
+            timer.cancel()
+        self._pending_removals.clear()
         for name, info in list(self._published.items()):
             self._unregister(name, info)
         if self._zc:
@@ -133,12 +166,17 @@ class ImpersonationBridge(ServiceListener):
     def add_service(self, zc: Zeroconf, type_: str, name: str) -> None:
         if self._name_suffix in name:
             return  # this is our own published copy being browsed back; ignore it
+        pending_removal = self._pending_removals.pop(name, None)
+        if pending_removal:
+            pending_removal.cancel()  # real record reappeared -- don't tear ours down
         info = zc.get_service_info(type_, name, timeout=3000)
         if not info or info.port is None:
             return
         if self._speaker_host not in info.parsed_addresses():
             return  # some other device on the network -- not the speaker we're relaying
-        fake = impersonated_service_info(type_, name, info, self._relay_host, self._name_suffix)
+        fake = impersonated_service_info(
+            type_, name, info, self._relay_host, self._name_suffix, self._force_buffered
+        )
         try:
             if name in self._published:
                 self._zc.update_service(fake)
@@ -158,6 +196,26 @@ class ImpersonationBridge(ServiceListener):
         self.add_service(zc, type_, name)
 
     def remove_service(self, zc: Zeroconf, type_: str, name: str) -> None:
+        if name not in self._published:
+            return
+        # A repeated remove_service for the same name (seen live: the real record can
+        # flap several times before settling) must reset the debounce clock, not stack a
+        # second timer -- an uncancelled earlier timer would still fire on its own
+        # original schedule and unregister the entry out from under a later, still-
+        # pending removal, undoing the whole point of debouncing.
+        existing = self._pending_removals.get(name)
+        if existing:
+            existing.cancel()
+        timer = threading.Timer(
+            _REMOVAL_GRACE_PERIOD_SECONDS, self._finish_removal, args=(name,)
+        )
+        timer.daemon = True
+        self._pending_removals[name] = timer
+        timer.start()
+
+    def _finish_removal(self, name: str) -> None:
+        self._pending_removals.pop(name, None)
         info = self._published.get(name)
         if info:
+            _LOGGER.info("%s did not reappear within grace period -- unpublishing relay copy", name)
             self._unregister(name, info)

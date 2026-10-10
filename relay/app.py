@@ -10,6 +10,7 @@ from relay.airplay import name_rewriter
 from relay.config import Config
 from relay.mdns import ImpersonationBridge, OnService
 from relay.proxy import RelayManager
+from relay.spoof import SpoofedUdpSender
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -82,21 +83,40 @@ async def ensure_airplay_event_ports(
             _LOGGER.warning("could not open standby UDP relay for port %d", port, exc_info=True)
 
 
-def make_on_service(manager: RelayManager) -> OnService:
+def make_on_service(manager: RelayManager, force_buffered: bool = False) -> OnService:
     """Build the mDNS-discovery callback: relay every discovered port, with the AirPlay
     /info name-rewrite hook attached only for _airplay._tcp itself."""
 
     async def on_service(type_: str, port: int, display_name: str) -> None:
         if type_ == _AIRPLAY_INFO_SERVICE_TYPE:
-            await manager.ensure(port, on_first_server_message=name_rewriter(display_name))
+            await manager.ensure(
+                port, on_first_server_message=name_rewriter(display_name, force_buffered)
+            )
         else:
             await manager.ensure(port)
 
     return on_service
 
 
+def _make_udp_spoof_sender() -> SpoofedUdpSender | None:
+    # Needs CAP_NET_RAW (present by default in Docker containers, see relay/spoof.py
+    # for why spoofing the client's own source address is necessary at all). Falls
+    # back to unspoofed forwarding rather than crashing the whole relay if it's
+    # missing -- e.g. running main.py directly outside a container without root.
+    try:
+        return SpoofedUdpSender()
+    except PermissionError:
+        _LOGGER.error(
+            "no permission to open a raw socket (need CAP_NET_RAW/root) -- "
+            "UDP relaying will use the relay's own address as source, which is known "
+            "to break AirPlay realtime audio (e.g. from the Spotify app)",
+            exc_info=True,
+        )
+        return None
+
+
 async def run(config: Config) -> None:
-    manager = RelayManager(config.relay_host, config.speaker_host)
+    manager = RelayManager(config.relay_host, config.speaker_host, _make_udp_spoof_sender())
 
     # Ports that always need relaying regardless of what mDNS discovers this run.
     for port in config.extra_ports:
@@ -112,9 +132,10 @@ async def run(config: Config) -> None:
         service_types=config.service_types,
         speaker_host=config.speaker_host,
         relay_host=config.relay_host,
-        on_service=make_on_service(manager),
+        on_service=make_on_service(manager, config.force_buffered_audio),
         loop=loop,
         name_suffix=config.name_suffix,
+        force_buffered=config.force_buffered_audio,
     )
     bridge.start()
     _LOGGER.info("relay running: %s -> %s", config.relay_host, config.speaker_host)

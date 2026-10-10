@@ -19,6 +19,8 @@ from __future__ import annotations
 import asyncio
 import logging
 
+from relay.spoof import SpoofedUdpSender
+
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -47,7 +49,10 @@ class _RelayProtocol(asyncio.DatagramProtocol):
             self._transport.sendto(data, relay.client_addr)
         else:
             relay.client_addr = addr
-            self._transport.sendto(data, (relay.target_host, relay.target_port))
+            if relay.spoof_sender is not None:
+                relay.spoof_sender.send(addr, (relay.target_host, relay.target_port), data)
+            else:
+                self._transport.sendto(data, (relay.target_host, relay.target_port))
 
 
 class UdpPortRelay:
@@ -55,12 +60,20 @@ class UdpPortRelay:
     most recent non-target peer, both ways, from the one bound socket -- so forwarded
     datagrams keep the relay's well-known source port (PTP peers expect 319/320)."""
 
-    def __init__(self, bind_host: str, port: int, target_host: str, target_port: int | None = None):
+    def __init__(
+        self,
+        bind_host: str,
+        port: int,
+        target_host: str,
+        target_port: int | None = None,
+        spoof_sender: SpoofedUdpSender | None = None,
+    ):
         self.bind_host = bind_host
         self.port = port
         self.target_host = target_host
         self.target_port = port if target_port is None else target_port
         self.client_addr: tuple[str, int] | None = None
+        self.spoof_sender = spoof_sender
         self._transport: asyncio.DatagramTransport | None = None
         self._protocol: _RelayProtocol | None = None
 

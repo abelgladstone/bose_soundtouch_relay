@@ -31,3 +31,10 @@ host = "192.0.2.10"
 # (unusable) announcement is still on the wire too and needs a distinct name to avoid
 # colliding with the relay's copy.
 name_suffix = " (relay)"
+
+# Advertise the speaker as buffered-audio-only: clear the RAOP feature bit in the AirPlay
+# /info response and the mDNS features/ft TXT records. Senders that would otherwise pick
+# AirPlay's realtime path -- notably the Spotify app, which then plays silently on this
+# speaker (FINDINGS.md issue #2) -- fall back to the buffered path that works. Defaults to
+# true; set false (or FORCE_BUFFERED_AUDIO=false) to advertise the speaker verbatim.
+force_buffered_audio = true

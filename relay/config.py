@@ -25,6 +25,18 @@ DEFAULT_SERVICE_TYPES = [
 ]
 DEFAULT_EXTRA_PORTS = [8080]
 DEFAULT_NAME_SUFFIX = " (relay)"
+# Advertise the speaker as buffered-audio-only (clear the RAOP feature bit in /info and the
+# mDNS TXT records) so senders that would otherwise pick the realtime path -- notably the
+# Spotify app, which then plays silently -- fall back to the buffered path that works. See
+# relay/airplay.py and FINDINGS.md issue #2. On by default; disable to restore verbatim
+# advertisement.
+DEFAULT_FORCE_BUFFERED_AUDIO = True
+
+
+def _env_bool(value: str | None) -> bool | None:
+    if value is None:
+        return None
+    return value.strip().lower() in ("1", "true", "yes", "on")
 
 
 @dataclass
@@ -34,6 +46,7 @@ class Config:
     service_types: list[str] = field(default_factory=lambda: list(DEFAULT_SERVICE_TYPES))
     extra_ports: list[int] = field(default_factory=lambda: list(DEFAULT_EXTRA_PORTS))
     name_suffix: str = DEFAULT_NAME_SUFFIX
+    force_buffered_audio: bool = DEFAULT_FORCE_BUFFERED_AUDIO
 
     @classmethod
     def load(cls, path: Path = CONFIG_PATH) -> "Config":
@@ -45,6 +58,10 @@ class Config:
         # matching bose_st300's BOSE_HOST convention.
         speaker_host = os.environ.get("SPEAKER_HOST") or speaker.get("host")
         relay_host = os.environ.get("RELAY_HOST") or relay.get("host")
+
+        force_buffered = _env_bool(os.environ.get("FORCE_BUFFERED_AUDIO"))
+        if force_buffered is None:
+            force_buffered = relay.get("force_buffered_audio", DEFAULT_FORCE_BUFFERED_AUDIO)
 
         missing = [
             name
@@ -63,4 +80,5 @@ class Config:
             service_types=speaker.get("service_types", list(DEFAULT_SERVICE_TYPES)),
             extra_ports=speaker.get("extra_ports", list(DEFAULT_EXTRA_PORTS)),
             name_suffix=relay.get("name_suffix", DEFAULT_NAME_SUFFIX),
+            force_buffered_audio=force_buffered,
         )

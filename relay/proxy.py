@@ -12,6 +12,7 @@ import asyncio
 import logging
 from typing import Awaitable, Callable
 
+from relay.spoof import SpoofedUdpSender
 from relay.udp import UdpPortRelay
 
 _LOGGER = logging.getLogger(__name__)
@@ -111,9 +112,12 @@ class PortRelay:
 class RelayManager:
     """Tracks active PortRelays by port so mDNS discovery can add/remove them idempotently."""
 
-    def __init__(self, bind_host: str, target_host: str):
+    def __init__(
+        self, bind_host: str, target_host: str, udp_spoof_sender: SpoofedUdpSender | None = None
+    ):
         self.bind_host = bind_host
         self.target_host = target_host
+        self._udp_spoof_sender = udp_spoof_sender
         self._relays: dict[int, PortRelay] = {}
         self._udp_relays: dict[int, UdpPortRelay] = {}
         self._lock = asyncio.Lock()
@@ -138,7 +142,9 @@ class RelayManager:
         async with self._lock:
             if port in self._udp_relays:
                 return
-            relay = UdpPortRelay(self.bind_host, port, self.target_host)
+            relay = UdpPortRelay(
+                self.bind_host, port, self.target_host, spoof_sender=self._udp_spoof_sender
+            )
             await relay.start()
             self._udp_relays[port] = relay
 
